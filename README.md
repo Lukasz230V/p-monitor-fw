@@ -1,53 +1,122 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# P-Monitor Firmware
 
-# Hello World Example
+ESP32-S3 firmware dla urządzenia Power-monitor, napisane z użyciem **ESP-IDF**.
 
-Starts a FreeRTOS task to print "Hello World".
+## Opis
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+Firmware obsługujący urządzenie do monitorowania poboru prądu podłączonych urządzeń. Po osiągnięciu ustawionego limitu poboru prądu, urządzenie automatycznie wyłącza zasilanie chroniąc przed przeciążeniem. Działa zarówno z prądami **AC jak i DC**.
 
-## How to use example
+## Wymagania
 
-Follow detailed instructions provided specifically for this example.
+- **ESP32-S3** development board
+- **ESP-IDF** (najnowsza wersja LTS lub stable)
+- **Python 3.7+**
+- Git
 
-Select the instructions depending on Espressif chip installed on your development board:
+## Instalacja i Build
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+### 1. Klonowanie repozytorium
 
-
-## Example folder contents
-
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
+```bash
+git clone https://github.com/Lukasz230V/p-monitor-fw.git
+cd p-monitor-fw
 ```
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+### 2. Konfiguracja ESP-IDF
+
+Upewnij się, że masz zainstalowany ESP-IDF. Jeśli nie:
+
+```bash
+git clone --recursive https://github.com/espressif/esp-idf.git
+cd esp-idf
+./install.bat  # Na Windows
+# lub
+./install.sh   # Na Linux/macOS
+source ./export.sh  # Aktywacja
+```
+
+### 3. Konfiguracja projektu
+
+```bash
+idf.py menuconfig
+```
+
+Tutaj możesz dostosować:
+- Parametry urządzenia
+- Limity prądu
+- Konfigurację BLE
+- Inne ustawienia
+
+### 4. Build
+
+```bash
+idf.py build
+```
+
+### 5. Upload do ESP32-S3
+
+```bash
+idf.py -p /dev/ttyUSB0 flash monitor
+```
+
+Na Windows zamiast `/dev/ttyUSB0` użyj portu COM (np. `COM3`).
+
+## Struktura projektu
+
+```
+.
+├── main/              # Kod główny aplikacji
+│   ├── main.c         # Punkt wejścia
+│   ├── main.h
+│   ├── ble_config_uuid.c    # Konfiguracja BLE
+│   ├── ble_config_uuid.h
+│   ├── nvs_dta.c      # Obsługa NVS (Non-Volatile Storage)
+│   └── nvs_dta.h
+├── components/        # Komponenty dodatkowe
+├── CMakeLists.txt     # Konfiguracja build
+├── sdkconfig          # Aktualne ustawienia projektu
+└── README.md          # Ten plik
+```
+
+## Powiązane projekty
+
+- **[Power-monitor](https://github.com/Lukasz230V/Power-monitor)** - Interfejs webowy do zarządzania urządzeniem (JavaScript/HTML/CSS)
+
+## Komunikacja
+
+Firmware komunikuje się z interfejsem web poprzez:
+- **BLE** (Bluetooth Low Energy)
+- **REST API** (jeśli dostępne)
 
 ## Troubleshooting
 
-* Program upload failure
+### Błąd uploadu
 
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
+```
+error: espressif/esp32s3 is not supported
+```
 
-## Technical support and feedback
+Sprawdź czy w `menuconfig` masz ustawiony prawidłowy target (ESP32-S3).
 
-Please use the following feedback channels:
+### Brak portu seryjnego
 
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
+Na Windows:
+- Zainstaluj sterowniki CH340 lub FTDI
+- Sprawdź Device Manager
 
-We will get back to you as soon as possible.
+Na Linux:
+```bash
+ls /dev/ttyUSB*
+sudo chmod 666 /dev/ttyUSB0  # Uprawnienia dostępu
+```
+
+## Licencja
+
+MIT
+
+## Wsparcie
+
+W razie problemów:
+1. Sprawdź dokumentację [ESP-IDF](https://docs.espressif.com/projects/esp-idf/)
+2. Stwórz [GitHub Issue](https://github.com/Lukasz230V/p-monitor-fw/issues)
+3. Odwiedź [esp32.com forum](https://esp32.com/)
