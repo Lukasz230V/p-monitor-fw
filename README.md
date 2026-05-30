@@ -2,6 +2,10 @@
 
 ESP32-S3 firmware dla urządzenia Power-monitor, napisane z użyciem **ESP-IDF**.
 
+## 🌐 Live Demo
+
+**[→ Otwórz aplikację PWA](https://lukasz230v.github.io/Power-monitor/)**
+
 ## Opis
 
 Firmware obsługujący urządzenie do monitorowania poboru prądu podłączonych urządzeń. Po osiągnięciu ustawionego limitu poboru prądu, urządzenie automatycznie wyłącza zasilanie chroniąc przed przeciążeniem. Działa zarówno z prądami **AC jak i DC**.
@@ -81,6 +85,7 @@ Na Windows zamiast `/dev/ttyUSB0` użyj portu COM (np. `COM3`).
 ## Powiązane projekty
 
 - **[Power-monitor](https://github.com/Lukasz230V/Power-monitor)** - Interfejs webowy do zarządzania urządzeniem (JavaScript/HTML/CSS)
+  - 🌐 **Live Demo:** https://lukasz230v.github.io/Power-monitor/
 
 ## Komunikacja
 
