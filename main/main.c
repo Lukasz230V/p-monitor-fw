@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: CC0-1.0
  */
-
+#include <stdint.h>
 #include <stdio.h>
 #include <inttypes.h>
 #include "sdkconfig.h"
@@ -21,7 +21,7 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 
-#include "esp_nimble_hci.h"
+//#include "esp_nimble_hci.h"
 #include "nimble/nimble_port.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "nimble/nimble_port_freertos.h"
@@ -47,15 +47,39 @@ static const char *MEM = "NVS";
 #define RELAY               GPIO_NUM_4
  #define CURR_ADC_UNIT       ADC_UNIT_1
  #define CURR_ADC_CHANNEL    ADC_CHANNEL_4
- #define ADC_MAX_STORE_BUF_SIZE 1024
- #define ADC_CONV_FRAME_SIZE    1024
+#define ADC_MAX_STORE_BUF_SIZE 4096
+#define ADC_CONV_FRAME_SIZE   1024
 
 // // --- PARAMETRY POMIAROWE I FILTRY ---
  #define RMS_WINDOW             2000    // 100ms przy 20kHz
- #define DEADBAND               3.0f//1.8f//0.6f    // minimalny sygnał
- #define OFFSET_FILTER_WEIGHT   0.001f // 0.001
- #define RMS_FILTER_ALPHA       0.2f    //0.2
- #define CURRENT_SCALE          0.0501f // 0.38
+ #define DEADBAND               0.8f//1.8f//0.6f    // minimalny sygnał
+
+  #define RMS_FILTER_ALPHA       0.3f    //0.2
+  #define CURRENT_SCALE          0.0501f // 0.38
+
+
+#define ADC_SAMPLE_FREQ_HZ       20000U
+#define RELAY_SETTLE_MS          150U
+//#define RELAY_SETTLE_SAMPLES     ((ADC_SAMPLE_FREQ_HZ * RELAY_SETTLE_MS) / 1000U)
+#define OFFSET_MIN_SAMPLES       500U
+
+
+//#define ADC_SAMPLE_FREQ_HZ       20000U
+#define RELAY_SETTLE_MS          150U
+
+// Maksymalny zapas na dane oczekujące w buforze ADC
+// oraz jedną ramkę przekazywaną do zadania.
+#define ADC_QUEUE_LATENCY_MS \
+    (((ADC_MAX_STORE_BUF_SIZE + ADC_CONV_FRAME_SIZE) * 1000U + \
+      (SOC_ADC_DIGI_RESULT_BYTES * ADC_SAMPLE_FREQ_HZ - 1U)) / \
+     (SOC_ADC_DIGI_RESULT_BYTES * ADC_SAMPLE_FREQ_HZ))
+
+// Czas stabilizacji + zapas na zalegające próbki ADC.
+#define RELAY_SETTLE_SAMPLES \
+    ((ADC_SAMPLE_FREQ_HZ * \
+      (RELAY_SETTLE_MS + ADC_QUEUE_LATENCY_MS) + 999U) / 1000U)
+
+
 // #define OFFSET_MAX_STEP        50.0f
  #define OFFSET_BROADCAST_INTERVAL_MS 500
 
@@ -63,11 +87,16 @@ static const char *MEM = "NVS";
 #define BIT_QUEUE (1 << 1)
 #define SETTINGS_CHANGED_BIT BIT0
 
+#define USE_TPAD 1
 
-#define TP_BTN                  TOUCH_PAD_NUM6   // Twój zdefiniowany pin (z logu wynika, że to T3)
-#define TOUCH_SAMPLE_PERIOD_MS  50             // Częstsze odpytywanie dla lepszej responsywności
-#define TOUCH_THRESHOLD_PER_MIL 38            // 25/1000 = 3.8% powyżej benchmarku
-#define TOUCH_HYST_PER_MIL      20             // 10/1000 = 2.0% histerezy  
+#if USE_TPAD == 1
+    #define TP_BTN                  TOUCH_PAD_NUM6   // Twój zdefiniowany pin (z logu wynika, że to T3)
+    #define TOUCH_SAMPLE_PERIOD_MS  50             // Częstsze odpytywanie dla lepszej responsywności
+    #define TOUCH_THRESHOLD_PER_MIL 38            // 25/1000 = 3.8% powyżej benchmarku
+    #define TOUCH_HYST_PER_MIL      20             // 10/1000 = 2.0% histerezy
+#else
+    #define SW_BTN GPIO_NUM_6
+#endif
 
 /**
  * @brief Typ wyliczeniowy definiujący dostępne operacje na przekaźniku.
@@ -151,13 +180,14 @@ void init_adc_continuous(void)
     adc_continuous_config_t dig_cfg = {
         .pattern_num = 1,
         .adc_pattern = adc_pattern,
-        .sample_freq_hz = 20000, // Częstotliwość próbkowania: 20 kHz
-        .conv_mode = ADC_CONV_SINGLE_UNIT_1, // Używamy tylko ADC1
+       // .sample_freq_hz = 20000, // Częstotliwość próbkowania: 20 kHz
+       .sample_freq_hz = ADC_SAMPLE_FREQ_HZ, 
+       .conv_mode = ADC_CONV_SINGLE_UNIT_1, // Używamy tylko ADC1
         .format = ADC_DIGI_OUTPUT_FORMAT_TYPE2, // ESP32-S3 używa formatu danych TYPE2
     };
 
     ESP_ERROR_CHECK(adc_continuous_config(continuous_adc_handle, &dig_cfg));
-};
+}
 
 
 void broadcast_adc_float(float value) {
@@ -347,111 +377,397 @@ if (ret != ESP_OK || app_settings.fw != fw) {
     xTimerStart(xPwrOnOffTimer,0);
 }  
 
-    
 
 
-static void adcTask(void * arg)
+/*********************************** NAJNOWSZA  ***************** */
+
+static bool adc_update_offset_estimate(
+    uint32_t count,
+    uint64_t sum,
+    uint64_t sum_sq,
+    float *offset,
+    double *noise_power)
 {
-    init_adc_continuous();
-    ESP_ERROR_CHECK(adc_continuous_start(continuous_adc_handle));
-
-    // --- ZMIENNE STANU (Static zachowuje wartość między cyklami pętli while) ---
-    static float rms_filtered = 0.0f;
-    static double sum_sq = 0.0;       // Double dla uniknięcia błędów zaokrągleń
-    static int total_samples = 0;
-    static int prev_relay = -1;
-    
-    static uint8_t result_buf[ADC_CONV_FRAME_SIZE];
-    uint32_t ret_num = 0;
-    TickType_t last_offset_broadcast = 0;
-
-    while(1)
+    if (count != RMS_WINDOW)
     {
-        // Timeout 100ms pozwala systemowi przełączyć się na inne zadania, gdy nie ma danych
-        esp_err_t ret = adc_continuous_read(
-                            continuous_adc_handle,
-                            result_buf,
-                            ADC_CONV_FRAME_SIZE,
-                            &ret_num,
-                            pdMS_TO_TICKS(100));
-
-        if (ret == ESP_OK)
-        {
-            int count = ret_num / SOC_ADC_DIGI_RESULT_BYTES;
-            int relay = get_set_relay_status(RL_GET);
-
-            // 1. WYKRYWANIE PRZEŁĄCZENIA - zapobiega mieszaniu danych ON/OFF
-            if (relay != prev_relay)
-            {
-                sum_sq = 0.0;
-                total_samples = 0;
-                rms_filtered = 0.0f;
-                prev_relay = relay;
-            }
-
-            for (int i = 0; i < count; i++)
-            {
-                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result_buf[i * SOC_ADC_DIGI_RESULT_BYTES];
-                float raw_val = (float)p->type2.data;
-
-                if (relay == RL_OFF)
-                {
-                    // 2. KALIBRACJA OFFSETU (tylko gdy przekaźnik wyłączony)
-                    // Filtr IIR: dynamic_offset dąży do średniej wartości zera urządzenia
-                    dynamic_offset += (raw_val - dynamic_offset) * OFFSET_FILTER_WEIGHT;
-                }
-                else 
-                {
-                    // 3. POMIAR RMS (gdy przekaźnik włączony)
-                    // Odejmujemy sprzętowy offset, by uzyskać czysty sygnał (AC+DC)
-                    double val = (double)raw_val - (double)dynamic_offset;
-                    sum_sq += (val * val);
-                    total_samples++;
-
-                    if (total_samples >= RMS_WINDOW)
-                    {
-                        float rms = sqrtf((float)(sum_sq / (double)total_samples));
-
-                        if (rms < DEADBAND) rms = 0.0f;
-
-                        // Wygładzanie wyniku filtrem RMS_FILTER_ALPHA
-                        rms_filtered = (1.0f - RMS_FILTER_ALPHA) * rms_filtered + RMS_FILTER_ALPHA * rms;
-
-                        sum_sq = 0.0;
-                        total_samples = 0;
-                    }
-                }
-            }
-
-            // 4. BROADCAST - Wysyłanie danych co interwał (np. 500ms)
-            TickType_t now = xTaskGetTickCount();
-            if ((now - last_offset_broadcast) * portTICK_PERIOD_MS >= OFFSET_BROADCAST_INTERVAL_MS)
-            {
-                // Jeśli przekaźnik OFF, wymuś zero (wygaszanie resztek z filtra)
-                float final_val = (relay == RL_ON) ? (rms_filtered * CURRENT_SCALE) : 0.0f;
-                
-                xQueueOverwrite(xQueueAdcHandle, &final_val);
-                xTaskNotify(xLogicTaskHandle, BIT_QUEUE, eSetBits); 
-                
-                last_offset_broadcast = now;
-            }
-
-            // 5. ODDANIE CZASU (Kluczowe dla Watchdoga)
-            // Wykonuje się raz na całą paczkę DMA, co jest bardzo efektywne
-            vTaskDelay(1);
-        }
-        else if (ret == ESP_ERR_TIMEOUT)
-        {
-            // Jeśli ADC nie wyrabia, dajemy chwilę na inne procesy
-            vTaskDelay(pdMS_TO_TICKS(2));
-        }
+        return false;
     }
+
+    const double n = (double)count;
+    const double mean = (double)sum / n;
+    const double mean_sq = (double)sum_sq / n;
+
+    // Moc szumu = wariancja próbek przy zerowym prądzie.
+    double variance = mean_sq - (mean * mean);
+
+    // Zabezpieczenie przed niewielkim ujemnym błędem numerycznym.
+    if (variance < 0.0)
+    {
+        variance = 0.0;
+    }
+
+    *offset = (float)mean;
+    *noise_power = variance;
+
+    return true;
 }
 
 
 
-                       
-                        
+static void adcTask(void *arg)
+{
+    (void)arg;
+
+    init_adc_continuous();
+    ESP_ERROR_CHECK(adc_continuous_start(continuous_adc_handle));
+
+    // Bufor DMA przekazywany do adc_continuous_read().
+    static uint8_t result_buf[ADC_CONV_FRAME_SIZE];
+
+    // Bufor kołowy offsetu: 2000 próbek = 100 ms przy 20 kHz.
+    static uint16_t offset_buf[RMS_WINDOW];
+
+    uint32_t offset_write = 0;
+    uint32_t offset_count = 0;
+
+    // Sumy próbek używane do szybkiego obliczania średniej
+    // i wariancji bez ponownego sumowania całego bufora.
+    uint64_t offset_sum = 0;
+    uint64_t offset_sum_sq = 0;
+
+    // Ostatni poprawny offset oraz oszacowana moc szumu.
+    float dynamic_offset = 0.0f;
+    double offset_noise_sq = 0.0;
+    bool offset_valid = false;
+
+    // Akumulator RMS.
+    double sum_sq = 0.0;
+    uint32_t total_samples = 0;
+    float rms_filtered = 0.0f;
+
+    int prev_relay = -1;
+    uint32_t settle_samples_remaining = 0;
+
+    TickType_t last_offset_broadcast = xTaskGetTickCount();
+    TickType_t broadcast_interval =
+        pdMS_TO_TICKS(OFFSET_BROADCAST_INTERVAL_MS);
+
+    if (broadcast_interval == 0)
+    {
+        broadcast_interval = 1;
+    }
+
+    while (1)
+    {
+        uint32_t ret_num = 0;
+
+        esp_err_t ret = adc_continuous_read(
+            continuous_adc_handle,
+            result_buf,
+            sizeof(result_buf),
+            &ret_num,
+            pdMS_TO_TICKS(100)
+        );
+
+        if (ret == ESP_ERR_TIMEOUT)
+        {
+            continue;
+        }
+
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(
+                "ADC",
+                "adc_continuous_read: %s",
+                esp_err_to_name(ret)
+            );
+
+            // Po utracie danych bieżące okno RMS nie jest ciągłe.
+            sum_sq = 0.0;
+            total_samples = 0;
+            rms_filtered = 0.0f;
+
+            // Odrzucamy nieciągłe okno kalibracyjne,
+            // zachowując ostatnią poprawną kalibrację.
+            offset_write = 0;
+            offset_count = 0;
+            offset_sum = 0;
+            offset_sum_sq = 0;
+
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+
+        if (ret_num == 0 ||
+            ret_num > sizeof(result_buf) ||
+            (ret_num % SOC_ADC_DIGI_RESULT_BYTES) != 0)
+        {
+            ESP_LOGW("ADC", "Nieprawidlowy rozmiar ramki ADC");
+
+            sum_sq = 0.0;
+            total_samples = 0;
+            rms_filtered = 0.0f;
+
+            offset_write = 0;
+            offset_count = 0;
+            offset_sum = 0;
+            offset_sum_sq = 0;
+
+            continue;
+        }
+
+        // -----------------------------------------------------
+        // 1. ODCZYT STANU PRZEKAŹNIKA
+        // -----------------------------------------------------
+
+        int relay = get_set_relay_status(RL_GET);
+
+        if (relay != RL_ON && relay != RL_OFF)
+        {
+            ESP_LOGW("ADC", "Nieprawidlowy stan przekaznika");
+            continue;
+        }
+
+        // -----------------------------------------------------
+        // 2. OBSŁUGA ZMIANY STANU
+        // -----------------------------------------------------
+
+        if (relay != prev_relay)
+        {
+            // Przy przejściu RL_OFF -> RL_ON wykorzystujemy
+            // ostatnie pełne okno zebrane przy zerowym prądzie.
+            if (prev_relay == RL_OFF && relay == RL_ON)
+            {
+                if (adc_update_offset_estimate(
+                    offset_count,
+                    offset_sum,
+                    offset_sum_sq,
+                    &dynamic_offset,
+                    &offset_noise_sq))
+                {
+                    offset_valid = true;
+                }
+            }
+
+            prev_relay = relay;
+
+            // Nowe okno RMS musi rozpocząć się po ustaleniu toru.
+            sum_sq = 0.0;
+            total_samples = 0;
+            rms_filtered = 0.0f;
+
+            // Nowe okno offsetu rozpoczynamy dopiero w RL_OFF.
+            offset_write = 0;
+            offset_count = 0;
+            offset_sum = 0;
+            offset_sum_sq = 0;
+
+            settle_samples_remaining = RELAY_SETTLE_SAMPLES;
+
+            // Odrzucamy całą ramkę, w której wykryto przełączenie.
+            continue;
+        }
+
+        // Zapis stanu kalibracji PRZED przetwarzaniem ramki.
+        // Może być potrzebny, jeśli przekaźnik zmieni stan
+        // w trakcie przetwarzania tej ramki.
+        const uint32_t offset_count_before_frame = offset_count;
+        const uint64_t offset_sum_before_frame = offset_sum;
+        const uint64_t offset_sum_sq_before_frame = offset_sum_sq;
+
+        const uint32_t count =
+            ret_num / SOC_ADC_DIGI_RESULT_BYTES;
+
+        // -----------------------------------------------------
+        // 3. PRZETWARZANIE PRÓBEK
+        // -----------------------------------------------------
+
+        for (uint32_t i = 0; i < count; i++)
+        {
+            adc_digi_output_data_t *p =
+                (adc_digi_output_data_t *)(
+                    &result_buf[i * SOC_ADC_DIGI_RESULT_BYTES]
+                );
+
+            const uint16_t raw = (uint16_t)p->type2.data;
+
+            // Odrzucamy próbki z okresu przejściowego.
+            if (settle_samples_remaining > 0)
+            {
+                settle_samples_remaining--;
+                continue;
+            }
+
+            // Pomijamy nieoczekiwany kanał ADC.
+            if (p->type2.channel != CURR_ADC_CHANNEL)
+            {
+                continue;
+            }
+
+            // -------------------------------------------------
+            // RL_OFF: BUFOR KOŁOWY OFFSETU I SZUMU
+            // -------------------------------------------------
+
+            if (relay == RL_OFF)
+            {
+                if (offset_count == RMS_WINDOW)
+                {
+                    // Usuwamy najstarszą próbkę z sum.
+                    const uint16_t old = offset_buf[offset_write];
+
+                    offset_sum -= (uint64_t)old;
+                    offset_sum_sq -= (uint64_t)old * (uint64_t)old;
+                }
+                else
+                {
+                    offset_count++;
+                }
+
+                // Wstawiamy najnowszą próbkę.
+                offset_buf[offset_write] = raw;
+
+                offset_sum += (uint64_t)raw;
+                offset_sum_sq += (uint64_t)raw * (uint64_t)raw;
+
+                offset_write++;
+
+                if (offset_write >= RMS_WINDOW)
+                {
+                    offset_write = 0;
+                }
+            }
+
+            // -------------------------------------------------
+            // RL_ON: TRUE RMS AC+DC Z KOMPENSACJĄ SZUMU
+            // -------------------------------------------------
+
+            else if (relay == RL_ON && offset_valid)
+            {
+                const double val =
+                    (double)raw - (double)dynamic_offset;
+
+                sum_sq += val * val;
+                total_samples++;
+
+                if (total_samples >= RMS_WINDOW)
+                {
+                    // Średnia kwadratów sygnału, łącznie z szumem.
+                    const double measured_sq =
+                        sum_sq / (double)total_samples;
+
+                    // Odejmujemy estymowaną moc szumu z RL_OFF.
+                    // Nie odejmujemy średniej sygnału pomiarowego,
+                    // dzięki czemu zachowujemy składową DC.
+                    double corrected_sq =
+                        measured_sq - offset_noise_sq;
+
+                    if (corrected_sq < 0.0)
+                    {
+                        corrected_sq = 0.0;
+                    }
+
+                    float rms = sqrtf((float)corrected_sq);
+
+                    // Próg w jednostkach kodów ADC.
+                    if (rms < DEADBAND)
+                    {
+                        rms = 0.0f;
+                    }
+
+                    // Zachowujemy dotychczasowe wygładzanie wyniku.
+                    rms_filtered =
+                        (1.0f - RMS_FILTER_ALPHA) * rms_filtered
+                        + RMS_FILTER_ALPHA * rms;
+
+                    sum_sq = 0.0;
+                    total_samples = 0;
+                }
+            }
+        }
+
+        // -----------------------------------------------------
+        // 4. KONTROLA ZMIANY PRZEKAŹNIKA PODCZAS RAMKI
+        // -----------------------------------------------------
+
+        const int relay_after = get_set_relay_status(RL_GET);
+
+        if (relay_after != relay)
+        {
+            // Jeżeli przełączenie RL_OFF -> RL_ON nastąpiło
+            // podczas przetwarzania ramki, do kalibracji używamy
+            // wyłącznie statystyk sprzed rozpoczęcia tej ramki.
+            if (relay == RL_OFF && relay_after == RL_ON)
+            {
+                if (adc_update_offset_estimate(
+                    offset_count_before_frame,
+                    offset_sum_before_frame,
+                    offset_sum_sq_before_frame,
+                    &dynamic_offset,
+                    &offset_noise_sq))
+            {
+             offset_valid = true;
+            }
+            }
+
+            prev_relay = relay_after;
+
+            sum_sq = 0.0;
+            total_samples = 0;
+            rms_filtered = 0.0f;
+
+            offset_write = 0;
+            offset_count = 0;
+            offset_sum = 0;
+            offset_sum_sq = 0;
+
+            settle_samples_remaining = RELAY_SETTLE_SAMPLES;
+
+            continue;
+        }
+
+        // -----------------------------------------------------
+        // 5. PUBLIKOWANIE WYNIKU
+        // -----------------------------------------------------
+
+        const TickType_t now = xTaskGetTickCount();
+
+        if ((TickType_t)(now - last_offset_broadcast) >=
+            broadcast_interval)
+        {
+            float final_val = 0.0f;
+
+            // Ponownie sprawdzamy stan przed opublikowaniem wyniku.
+            const int relay_for_publish =
+                get_set_relay_status(RL_GET);
+
+            if (relay == RL_ON &&
+                relay_for_publish == RL_ON &&
+                settle_samples_remaining == 0 &&
+                offset_valid)
+            {
+                final_val = rms_filtered * CURRENT_SCALE;
+            }
+
+            xQueueOverwrite(xQueueAdcHandle, &final_val);
+
+            xTaskNotify(
+                xLogicTaskHandle,
+                BIT_QUEUE,
+                eSetBits
+            );
+
+            last_offset_broadcast = now;
+        }
+
+        // Nie dodajemy vTaskDelay(1) po każdej ramce:
+        // adc_continuous_read() sam oczekuje na dane,
+        // a dodatkowe opóźnienie mogłoby powodować narastanie
+        // zaległości w buforze ADC.
+    }
+}
+
+/**************** END       *********** */
+
 void host_task(void *param)
 {
     nimble_port_run();
@@ -471,11 +787,6 @@ void bt_serwer_task(void * arg) {
 
 
     ble_uuid_init_all();
-
-
-
-
-
     // 2. Rejestracja usług
     ble_gatts_count_cfg(gatt_svcs);
    // ble_gatts_add_svcs(gatt_svcs);
@@ -752,6 +1063,7 @@ static int8_t get_set_relay_status(relay_action_t action)
 
 void touch_polling_task(void *pvParameters) {
 
+#if USE_TPAD == 1
     touch_pad_init();
     touch_pad_config(TP_BTN);
 
@@ -795,9 +1107,19 @@ void touch_polling_task(void *pvParameters) {
   
        uint32_t raw = 0;
     uint32_t bench = 0;
-    bool is_pressed = false;
-  
+     bool is_pressed = false;
+#else
+    gpio_set_direction(SW_BTN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(SW_BTN, GPIO_PULLUP_ONLY);
+    uint8_t task_timer = 0;
+    int8_t last_state = -1;
+
+#endif
+
+ESP_LOGI("TP", "Touchpad filter init");
+
     while (1) {
+#if USE_TPAD == 1
         if (touch_pad_read_raw_data(TP_BTN, &raw) == ESP_OK &&
             touch_pad_read_benchmark(TP_BTN, &bench) == ESP_OK) {
             
@@ -827,13 +1149,33 @@ void touch_polling_task(void *pvParameters) {
                 }
             }
         }
-
-
-
-
-
         vTaskDelay(pdMS_TO_TICKS(TOUCH_SAMPLE_PERIOD_MS));
+#else
+        if (0 == gpio_get_level(SW_BTN) && task_timer == 0) {
+            // klik
+
+            last_state = get_set_relay_status(RL_GET);
+
+        }
+
+        if (0 == gpio_get_level(SW_BTN) && last_state != -1) {
+                task_timer +=1;
+                    if (3 == task_timer && last_state == RL_OFF) {
+                        get_set_relay_status(RL_ON);
+                        broadcast_relay_status(get_set_relay_status(RL_ON));
+                        last_state = -1;
+                    }else if (9 == task_timer && last_state == RL_ON) {
+                        get_set_relay_status(RL_OFF);
+                        broadcast_relay_status(get_set_relay_status(RL_OFF));
+                        last_state = -1;
+            }
+        }else if (1 == gpio_get_level(SW_BTN) && task_timer) {
+            task_timer = 0;
+        }
+
+
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+#endif
     }
 }
-
-
